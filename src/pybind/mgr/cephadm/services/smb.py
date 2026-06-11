@@ -32,6 +32,8 @@ from .cephadmservice import (
     simplified_keyring,
 )
 from ..schedule import DaemonPlacement
+from smb.mon_store import MonKeyConfigStore
+from smb.external import rgw_config_key as _smb_rgw_config_key
 
 if TYPE_CHECKING:
     from ..module import CephadmOrchestrator
@@ -158,6 +160,16 @@ class SMBService(CephService):
         config_blobs['cluster_id'] = smb_spec.cluster_id
         config_blobs['features'] = smb_spec.features
         config_blobs['config_uri'] = smb_spec.config_uri
+        # For RGW clusters, append the private-store config as an extra URI
+        # loaded after the public config.  sambacc's config:merge is a general
+        # merge mechanism; here the mgr populates it with only the RGW
+        # credential fields, keeping the public config the primary source of
+        # truth.
+        _rgw_entry = MonKeyConfigStore(self.mgr)[
+            _smb_rgw_config_key(smb_spec.cluster_id)
+        ]
+        if _rgw_entry.exists():
+            config_blobs['extra_config_uris'] = [_rgw_entry.uri]
         _add_cfg(config_blobs, 'join_sources', smb_spec.join_sources)
         _add_cfg(config_blobs, 'user_sources', smb_spec.user_sources)
         _add_cfg(config_blobs, 'custom_dns', smb_spec.custom_dns)
