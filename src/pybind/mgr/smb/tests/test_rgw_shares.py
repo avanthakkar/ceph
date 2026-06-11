@@ -3,6 +3,7 @@ import json
 import pytest
 
 import smb
+import smb.external
 
 
 class _FakeToolExecer:
@@ -273,3 +274,162 @@ def test_multiple_rgw_shares_same_cluster(thandler):
     # Verify credentials were auto-fetched
     assert share1_dict['rgw']['access_key_id'] == 'AUTO_FETCHED_ACCESS_KEY'
     assert share2_dict['rgw']['access_key_id'] == 'AUTO_FETCHED_ACCESS_KEY'
+
+
+# ---- priv-store credential isolation tests ----
+# These tests use SEPARATE public and private stores so each can be
+# independently inspected.  The real credential values must
+# only ever appear in the private store (via a config:merge stub), never in
+# the public RADOS config.
+
+
+@pytest.fixture
+def split_handler():
+    """Handler with separate public and private stores."""
+    pub = smb.config_store.MemConfigStore()
+    priv = smb.config_store.MemConfigStore()
+    h = smb.handler.ClusterConfigHandler(
+        internal_store=smb.config_store.MemConfigStore(),
+        public_store=pub,
+        priv_store=priv,
+        tool_execer=_FakeToolExecer(),
+    )
+    return h, pub, priv
+
+
+def _rgw_cluster_and_share(cluster_id, share_id, share_name, **rgw_kwargs):
+    cluster = _cluster(
+        cluster_id=cluster_id,
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+    share = smb.resources.Share(
+        cluster_id=cluster_id,
+        share_id=share_id,
+        name=share_name,
+        rgw=smb.resources.RGWStorage(**rgw_kwargs),
+    )
+    return cluster, share
+
+
+def test_rgw_credentials_absent_from_public_config(split_handler):
+    """Credential values must be empty strings in the public RADOS config."""
+    h, pub, priv = split_handler
+    cluster, share = _rgw_cluster_and_share(
+        'c1',
+        's1',
+        'mybucket',
+        bucket='mybucket',
+        user_id='testuser',
+        access_key_id='AKID1234',
+        secret_access_key='SecretXYZ',
+    )
+    rg = h.apply([cluster, share])
+    assert rg.success, rg.to_simplified()
+
+    pub_cfg = pub['c1', 'config.smb'].get()
+    opts = pub_cfg['shares']['mybucket']['options']
+    assert opts['ceph_rgw:access_key'] == ''
+    assert opts['ceph_rgw:secret_access_key'] == ''
+
+
+def test_rgw_credential_stub_written_to_priv_store(split_handler):
+    """Private store must hold config:merge stub with real credential values."""
+    h, pub, priv = split_handler
+    cluster, share = _rgw_cluster_and_share(
+        'c1',
+        's1',
+        'mybucket',
+        bucket='mybucket',
+        user_id='testuser',
+        access_key_id='AKID1234',
+        secret_access_key='SecretXYZ',
+    )
+    rg = h.apply([cluster, share])
+    assert rg.success, rg.to_simplified()
+
+    stub = priv['c1', 'config.smb.rgw'].get()
+    assert stub['samba-container-config'] == 'v0'
+    assert 'config:merge' in stub
+    opts = stub['config:merge']['shares']['mybucket']['options']
+    assert opts['ceph_rgw:access_key'] == 'AKID1234'
+    assert opts['ceph_rgw:secret_access_key'] == 'SecretXYZ'
+
+
+def test_no_priv_store_entry_for_non_rgw_cluster(split_handler):
+    """A cluster with no RGW shares must not write a credential stub."""
+    h, pub, priv = split_handler
+    cluster = _cluster(
+        cluster_id='cephfs1',
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+    share = smb.resources.Share(
+        cluster_id='cephfs1',
+        share_id='fsshare',
+        name='FS Share',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/',
+        ),
+    )
+    rg = h.apply([cluster, share])
+    assert rg.success, rg.to_simplified()
+
+    stub_entry = priv['cephfs1', 'config.smb.rgw']
+    assert not stub_entry.exists()
+
+
+def test_multi_share_stub_covers_all_rgw_shares(split_handler):
+    """Credential stub must contain entries for every RGW share."""
+    h, pub, priv = split_handler
+    cluster = _cluster(
+        cluster_id='multi',
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+    share1 = smb.resources.Share(
+        cluster_id='multi',
+        share_id='s1',
+        name='bucket1',
+        rgw=smb.resources.RGWStorage(
+            bucket='bucket1',
+            user_id='u1',
+            access_key_id='AK1',
+            secret_access_key='SK1',
+        ),
+    )
+    share2 = smb.resources.Share(
+        cluster_id='multi',
+        share_id='s2',
+        name='bucket2',
+        rgw=smb.resources.RGWStorage(
+            bucket='bucket2',
+            user_id='u2',
+            access_key_id='AK2',
+            secret_access_key='SK2',
+        ),
+    )
+    rg = h.apply([cluster, share1, share2])
+    assert rg.success, rg.to_simplified()
+
+    stub = priv['multi', 'config.smb.rgw'].get()
+    merge_shares = stub['config:merge']['shares']
+    b1opts = merge_shares['bucket1']['options']
+    b2opts = merge_shares['bucket2']['options']
+    assert b1opts['ceph_rgw:access_key'] == 'AK1'
+    assert b1opts['ceph_rgw:secret_access_key'] == 'SK1'
+    assert b2opts['ceph_rgw:access_key'] == 'AK2'
+    assert b2opts['ceph_rgw:secret_access_key'] == 'SK2'
